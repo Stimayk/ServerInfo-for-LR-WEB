@@ -1,4 +1,8 @@
 # ServerInfo-for-LR-WEB
+# RU: https://csdevs.net/resources/serverinfo-dlja-lr-web.553/
+
+# EN:
+
 Stumbled on Discord server on the monitoring module for the template Rich and decided to restore its work by rewriting the plugin to work in CS2.
 Realized everything except getting rank and time on the server
 If the first I just did not decide whose plugin to use to get rank, the second is likely to do in the foreseeable future.
