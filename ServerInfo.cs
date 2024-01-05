@@ -4,25 +4,40 @@ using CounterStrikeSharp.API;
 using System.Text.RegularExpressions;
 using System.Text;
 using CounterStrikeSharp.API.Modules.Timers;
+using CounterStrikeSharp.API.Core.Attributes.Registration;
 
 namespace ServerInfo
 {
     public partial class ServerInfo : BasePlugin
     {
         public override string ModuleName => "ServerInfo for LR WEB";
-        public override string ModuleVersion => "1.0";
+        public override string ModuleAuthor => "E!N";
+        public override string ModuleVersion => "1.1";
+
         private const int MaxPlayers = 65;
         private string server = "";
         private string password = "";
         private string url = "";
         private float timerInterval = 40.0f;
 
+        public Dictionary<int, PlayerInfo> PlayerList { get; set; } = new();
+
         public override void Load(bool hotReload)
         {
             LoadCfg();
             var ip = GetIP();
-            AddCommand("css_getserverinfo", "Get server info", (player, info) => OnGetInfo());
-            AddTimer(timerInterval, OnGetInfo, TimerFlags.REPEAT);
+            AddCommand("css_getserverinfo", "Get server info", (player, info) => UpdatePlayerInfo());
+            AddTimer(timerInterval, UpdatePlayerInfo, TimerFlags.REPEAT);
+
+            RegisterListener<Listeners.OnClientAuthorized>((slot, steamid) =>
+            {
+                CCSPlayerController? player = Utilities.GetPlayerFromSlot(slot);
+                if (!IsPlayerValid(player)) return;
+                AddTimer(1.0f, () =>
+                {
+                    InitPlayers(player);
+                });
+            });
         }
 
         private void LoadCfg()
@@ -95,15 +110,56 @@ namespace ServerInfo
             return $"{serverIp}:{serverPort}";
         }
 
-        private void OnGetInfo()
+        [GameEventHandler]
+        private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
         {
-            if (!string.IsNullOrEmpty(server))
+            CCSPlayerController _player = @event.Userid;
+
+            if (!IsPlayerValid(_player)) return HookResult.Continue;
+            if (PlayerList.TryGetValue(_player.Slot, out var theplayer))
             {
-                SendServerInfo();
+                PlayerList.Remove(_player.Slot);
             }
-            else
+            return HookResult.Continue;
+        }
+
+        public void InitPlayers(CCSPlayerController player)
+        {
+            if (!IsPlayerValid(player)) return;
+
+            PlayerInfo playerInfo = new()
             {
-                Server.PrintToConsole("Ошибка: информация о сервере не установлена.");
+                UserId = player.UserId,
+                SteamId = player.AuthorizedSteamID?.SteamId64.ToString(),
+                Name = player.PlayerName,
+                Kills = player.ActionTrackingServices?.MatchStats.Kills ?? 0,
+                Deaths = player.ActionTrackingServices?.MatchStats.Deaths ?? 0,
+                Assists = player.ActionTrackingServices?.MatchStats.Assists ?? 0,
+                Headshots = player.ActionTrackingServices?.MatchStats.HeadShotKills ?? 0
+            };
+
+            PlayerList[player.Slot] = playerInfo;
+        }
+
+        private void UpdatePlayerInfo()
+        {
+            foreach (var playerInfo in PlayerList.Values)
+            {
+                if (playerInfo.UserId != null)
+                {
+                    var player = Utilities.GetPlayerFromUserid((int)playerInfo.UserId);
+                    if (player != null && IsPlayerValid(player))
+                    {
+                        playerInfo.Kills = player.ActionTrackingServices?.MatchStats.Kills ?? 0;
+                        playerInfo.Deaths = player.ActionTrackingServices?.MatchStats.Deaths ?? 0;
+                        playerInfo.Assists = player.ActionTrackingServices?.MatchStats.Assists ?? 0;
+                        playerInfo.Headshots = player.ActionTrackingServices?.MatchStats.HeadShotKills ?? 0;
+                    }
+                    if (!string.IsNullOrEmpty(server))
+                    {
+                        SendServerInfo(playerInfo);
+                    }
+                }
             }
         }
 
@@ -115,51 +171,36 @@ namespace ServerInfo
             return (t1score, t2score);
         }
 
-        private void SendServerInfo()
+        private void SendServerInfo(PlayerInfo playerinfo)
         {
             if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(url) || string.IsNullOrEmpty(password))
             {
-                Server.PrintToConsole("URL, сервер или пароль не установлены.");
                 return;
             }
 
-            var jsonPlayers = GetPlayersJson();
+            var jsonPlayers = GetPlayersJson(playerinfo);
             var (t1score, t2score) = GetTeamsScore();
             var jsonData = new { score_ct = t1score, score_t = t2score, players = jsonPlayers };
             var jsonString = System.Text.Json.JsonSerializer.Serialize(jsonData);
-
             PostData(jsonString);
         }
 
-        private static List<object> GetPlayersJson()
+        private static List<object> GetPlayersJson(PlayerInfo playerinfo)
         {
-            var jsonPlayers = new List<object>();
-
-            for (int i = 0; i < MaxPlayers; i++)
+            var jsonPlayers = new List<object>
             {
-                var player = Utilities.GetPlayerFromIndex(i);
-
-                if (player == null) continue;
-
-                if (player.IsValid && !player.IsBot && player.SteamID != 0 && player.PlayerPawn != null)
+                new
                 {
-                    if (player.ActionTrackingServices != null && player.ActionTrackingServices.MatchStats != null)
-                    {
-                        jsonPlayers.Add(new
-                        {
-                            name = player.PlayerName,
-                            steamid = player.SteamID,
-                            kills = player.ActionTrackingServices.MatchStats.Kills,
-                            assists = player.ActionTrackingServices.MatchStats.Assists,
-                            death = player.ActionTrackingServices.MatchStats.Deaths,
-                            headshots = player.ActionTrackingServices.MatchStats.HeadShotKills,
-                            rank = "0",
-                            playtime = 0
-                        });
-                    }
+                    name = playerinfo.Name ?? "Unknown",
+                    steamid = playerinfo.SteamId?.ToString(),
+                    kills = playerinfo.Kills.ToString(),
+                    assists = playerinfo.Deaths.ToString(),
+                    death = playerinfo.Assists.ToString(),
+                    headshots = playerinfo.Headshots.ToString(),
+                    rank = "0",
+                    playtime = 0
                 }
-            }
-
+            };
             return jsonPlayers;
         }
 
@@ -185,9 +226,29 @@ namespace ServerInfo
             {
                 Server.PrintToConsole($"Exception in HTTP request: {ex.Message}");
             }
+
+        }
+
+        public static bool IsPlayerValid(CCSPlayerController? player)
+        {
+            return (player is
+            {
+                IsValid: true, IsBot: false, IsHLTV: false
+            }); ;
         }
 
         [GeneratedRegex("\"([^\"]+)\"\\s+\"([^\"]+)\"")]
         private static partial Regex MyRegex();
+    }
+
+    public class PlayerInfo
+    {
+        public int? UserId { get; set; }
+        public string? SteamId { get; set; }
+        public string? Name { get; set; }
+        public int? Kills { get; set; } = 0;
+        public int? Deaths { get; set; } = 0;
+        public int? Assists { get; set; } = 0;
+        public int? Headshots { get; set; } = 0;
     }
 }
