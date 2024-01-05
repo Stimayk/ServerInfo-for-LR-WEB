@@ -14,7 +14,8 @@ From the changes in the plugin:
 Server information will be updated after a configurable time (in seconds) in server_info.ini
 As I understood, previously it was done through Rcon, but in cs2 it seems to be absent or I do not know something, so I did it this way
 
-The archive contains the plugin and the module itself, taken from the above mentioned Discord server.
+The archive contains only the plugin, the module itself must be taken from the Discord server (https://discord.com/invite/sYKAk3GCbD)
+
 Also slightly modified the installation in the archive, which I will duplicate below.
 
 The code is 100% not perfect, there may be flaws and bugs, if any, please notify me with as much information as possible (logs, what you do, at what point, etc).
@@ -36,10 +37,12 @@ css_getserverinfo - force server information update
 
 1.Install the contents of the PLUGIN folder on the server /game/csgo/addons/counterstrikesharp/
 
-1.1.Set up the config /game/csgo/addons/counterstrikesharp/configs/server_info.ini
+    1.1.Customize the config /game/csgo/addons/counterstrikesharp/configs/server_info.ini
 
-2.Install the contents of the WEB folder on your site in the app/modules/ folder.
+2.Download WEB module from https://discord.com/invite/sYKAk3GCbD
 
-2.1 Go to the forward folder in the file js_controller.php and change the password to the one you specified during setup (at the end of line 5)
+	2.1 Install the contents of the WEB folder on your site in the app/modules/ folder.
 
-3.Restart the server and update modules and translations in the web admin panel.
+    2.2 Go to the forward folder in the js_controller.php file and change the password to the one you specified during configuration (line 5).
+
+3.Restart the server and update modules and translations in the web admin panel
