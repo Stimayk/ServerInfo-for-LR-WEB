@@ -5,10 +5,14 @@
 
 Stumbled on Discord server on the monitoring module for the template Rich and decided to restore its work by rewriting the plugin to work in CS2.
 Realized everything except getting rank and time on the server
-If the first I just did not decide whose plugin to use to get rank, the second is likely to do in the foreseeable future.
-Otherwise - I have not touched the web module, everything should work as before, but it is not sure
+The rank will be displayed only when working with the statistics plugin (https://github.com/ABKAM2023/CS2-RanksPoints)
+Otherwise - I haven't touched the web module, everything should work as before but it's not for sure
 
 ![image](https://github.com/Stimayk/ServerInfo-for-LR-WEB/assets/51941742/b04497a7-a3aa-4ad4-a9ef-51e9bfc0c515)
+
+Version 1.2 and above:
+![image](https://github.com/Stimayk/ServerInfo-for-LR-WEB/assets/51941742/c83698d5-1052-402d-a972-da39a41f1fbe)
+
 
 From the changes in the plugin:
 Server information will be updated after a configurable time (in seconds) in server_info.ini
@@ -26,6 +30,10 @@ Suggestions for improvement are also welcome, maybe I will do something.
 LR WEB
 
 Rich template
+
+WEB Module (https://discord.com/invite/sYKAk3GCbD)
+
+RanksPoints (https://github.com/ABKAM2023/CS2-RanksPoints) for rank display
 
 CSSharp
 
