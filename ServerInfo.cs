@@ -30,9 +30,9 @@ namespace ServerInfo
         {
             LoadCfg();
             var ip = GetIP();
-            AddCommand("css_getserverinfo", "Get server info", async (player, info) => await UpdatePlayerInfo());
+            AddCommand("css_getserverinfo", "Get server info", (player, info) => UpdatePlayerInfo());
             AddCommand("css_reloadserverinfo", "Forced to read the cfg", (player, info) => LoadCfg());
-            AddTimer(timerInterval, async () => await UpdatePlayerInfo(), TimerFlags.REPEAT);
+            AddTimer(timerInterval, UpdatePlayerInfo, TimerFlags.REPEAT);
 
             RegisterListener<Listeners.OnClientAuthorized>((slot, steamid) =>
             {
@@ -279,23 +279,31 @@ namespace ServerInfo
             }
         }
 
-        private async Task UpdatePlayerInfo()
+        private void UpdatePlayerInfo()
         {
+            Server.PrintToChatAll("1");
             LogDebug("Updating player info for all players...");
-            if (PlayerList.Any())
+            foreach (var playerInfo in PlayerList.Values)
             {
-                foreach (var playerInfo in PlayerList.Values)
+                if (playerInfo.UserId != null)
                 {
-                    LogDebug($"Player info - Name: {playerInfo.Name}, SteamID: {playerInfo.SteamId}, Kills: {playerInfo.Kills}, Deaths: {playerInfo.Deaths}, Assists: {playerInfo.Assists}, Headshots: {playerInfo.Headshots}");
-                    await SendServerInfo(playerInfo);
+                    var player = Utilities.GetPlayerFromUserid((int)playerInfo.UserId);
+                    if (player != null && IsPlayerValid(player))
+                    {
+                        playerInfo.Kills = player.ActionTrackingServices?.MatchStats.Kills ?? 0;
+                        playerInfo.Deaths = player.ActionTrackingServices?.MatchStats.Deaths ?? 0;
+                        playerInfo.Assists = player.ActionTrackingServices?.MatchStats.Assists ?? 0;
+                        playerInfo.Headshots = player.ActionTrackingServices?.MatchStats.HeadShotKills ?? 0;
+                    }
+                    if (!string.IsNullOrEmpty(server))
+                    {
+                        SendServerInfo(playerInfo);
+                    }
                 }
-            }
-            else
-            {
-                LogDebug("No players on the server.");
-                await SendServerInfo();
+                LogDebug($"Updated player info for player: {playerInfo.Name}");
             }
             LogDebug("All player info updated.");
+            Server.PrintToChatAll("2");
         }
 
         private static (int t1score, int t2score) GetTeamsScore()
@@ -306,13 +314,14 @@ namespace ServerInfo
             return (t1score, t2score);
         }
 
-        private async Task SendServerInfo(PlayerInfo? playerinfo = null)
+        private void SendServerInfo(PlayerInfo playerinfo)
         {
             LogDebug("Preparing to send server info...");
             if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(url) || string.IsNullOrEmpty(password))
             {
                 return;
             }
+            LogDebug($"Server info for player {playerinfo.Name} prepared for sending.");
 
             List<object> jsonPlayers;
             if (playerinfo != null)
@@ -328,7 +337,7 @@ namespace ServerInfo
             var jsonData = new { score_ct = t1score, score_t = t2score, players = jsonPlayers };
             var jsonString = System.Text.Json.JsonSerializer.Serialize(jsonData);
 
-            await PostData(jsonString);
+            Task.Run(async () => await PostData(jsonString)).Wait();
             LogDebug("Server info sent.");
         }
 
