@@ -281,7 +281,6 @@ namespace ServerInfo
 
         private void UpdatePlayerInfo()
         {
-            Server.PrintToChatAll("1");
             LogDebug("Updating player info for all players...");
             foreach (var playerInfo in PlayerList.Values)
             {
@@ -303,7 +302,6 @@ namespace ServerInfo
                 LogDebug($"Updated player info for player: {playerInfo.Name}");
             }
             LogDebug("All player info updated.");
-            Server.PrintToChatAll("2");
         }
 
         private static (int t1score, int t2score) GetTeamsScore()
