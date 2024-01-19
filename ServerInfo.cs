@@ -1,4 +1,4 @@
-﻿using CounterStrikeSharp.API.Core;
+using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API;
 using System.Text.RegularExpressions;
@@ -14,7 +14,7 @@ namespace ServerInfo
     {
         public override string ModuleName => "ServerInfo for LR WEB";
         public override string ModuleAuthor => "E!N";
-        public override string ModuleVersion => "1.3";
+        public override string ModuleVersion => "1.4";
 
         private bool isDebugMode = false;
 
@@ -23,6 +23,7 @@ namespace ServerInfo
         private string password = "";
         private string url = "";
         private float timerInterval = 40.0f;
+        private int statistic_type = 0;
 
         public Dictionary<int, PlayerInfo> PlayerList { get; set; } = new();
 
@@ -32,7 +33,7 @@ namespace ServerInfo
             var ip = GetIP();
             AddCommand("css_getserverinfo", "Get server info", (player, info) => UpdatePlayerInfo());
             AddCommand("css_reloadserverinfo", "Forced to read the cfg", (player, info) => LoadCfg());
-            AddTimer(timerInterval, UpdatePlayerInfo, TimerFlags.REPEAT);
+            AddTimer(timerInterval, () => UpdatePlayerInfo(), TimerFlags.REPEAT);
 
             RegisterListener<Listeners.OnClientAuthorized>((slot, steamid) =>
             {
@@ -111,6 +112,7 @@ namespace ServerInfo
                         else if (key == "url") url = value;
                         else if (key == "timer_interval" && float.TryParse(value, out float interval)) timerInterval = interval;
                         else if (key == "debug_mode") isDebugMode = value.ToLower() == "true";
+                        else if (key == "statistic_type" && int.TryParse(value, out int type)) statistic_type = type;
                         LogDebug($"Parsed key: {key}, value: {value}");
 
                     }
@@ -175,46 +177,33 @@ namespace ServerInfo
 
         private DbConfig? LoadDbConfig()
         {
-            string firstConfigFilePath = Path.Combine(Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "", "plugins/RanksPoints/dbconfig.json");
-            if (File.Exists(firstConfigFilePath))
+            string configFilePath;
+            switch (statistic_type)
             {
-                LogDebug("Loading primary dbconfig from: " + firstConfigFilePath);
-                return JsonConvert.DeserializeObject<DbConfig>(File.ReadAllText(firstConfigFilePath));
+                case 1:
+                    configFilePath = Path.Combine(Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "", "plugins/RanksPoints/dbconfig.json");
+                    break;
+                case 2:
+                    configFilePath = Path.Combine(Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "", "plugins/Ranks/settings_ranks.json");
+                    break;
+                //case 3:
+                //    configFilePath = ""; TO DO: LevelsRanks
+                //    break;
+                default:
+                    LogDebug("Database not configured or disabled.");
+                    return null;
+            }
+
+            if (File.Exists(configFilePath))
+            {
+                LogDebug("Loading dbconfig from: " + configFilePath);
+                return JsonConvert.DeserializeObject<DbConfig>(File.ReadAllText(configFilePath));
             }
             else
             {
-                LogDebug("Primary dbconfig not found at: " + firstConfigFilePath);
+                LogDebug("Dbconfig not found at: " + configFilePath);
+                return null;
             }
-
-            string secondConfigFilePath = Path.Combine(Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "", "plugins/Ranks/settings_ranks.json");
-            if (File.Exists(secondConfigFilePath))
-            {
-                LogDebug("Loading alternative config from: " + secondConfigFilePath);
-                var alternativeConfig = JsonConvert.DeserializeObject<AlternativeConfig>(File.ReadAllText(secondConfigFilePath));
-                if (alternativeConfig?.Connection != null)
-                {
-                    return new DbConfig
-                    {
-                        DbHost = alternativeConfig.Connection.Host,
-                        DbUser = alternativeConfig.Connection.User,
-                        DbPassword = alternativeConfig.Connection.Password,
-                        DbName = alternativeConfig.Connection.Database,
-                        DbPort = "3306",
-                        Name = alternativeConfig.TableName
-                    };
-                }
-                else
-                {
-                    LogDebug("Alternative config loaded but connection details are missing.");
-                }
-            }
-            else
-            {
-                LogDebug("Alternative config not found at: " + secondConfigFilePath);
-            }
-
-            LogDebug("No valid database configuration found.");
-            return null;
         }
 
         [GameEventHandler]
@@ -271,6 +260,7 @@ namespace ServerInfo
             LogDebug($"Play time for {playerInfo.Name}: {playTime} seconds");
             return playTime;
         }
+
         private void LogDebug(string message)
         {
             if (isDebugMode)
@@ -282,24 +272,18 @@ namespace ServerInfo
         private void UpdatePlayerInfo()
         {
             LogDebug("Updating player info for all players...");
-            foreach (var playerInfo in PlayerList.Values)
+            if (PlayerList.Any())
             {
-                if (playerInfo.UserId != null)
+                foreach (var playerInfo in PlayerList.Values)
                 {
-                    var player = Utilities.GetPlayerFromUserid((int)playerInfo.UserId);
-                    if (player != null && IsPlayerValid(player))
-                    {
-                        playerInfo.Kills = player.ActionTrackingServices?.MatchStats.Kills ?? 0;
-                        playerInfo.Deaths = player.ActionTrackingServices?.MatchStats.Deaths ?? 0;
-                        playerInfo.Assists = player.ActionTrackingServices?.MatchStats.Assists ?? 0;
-                        playerInfo.Headshots = player.ActionTrackingServices?.MatchStats.HeadShotKills ?? 0;
-                    }
-                    if (!string.IsNullOrEmpty(server))
-                    {
-                        SendServerInfo(playerInfo);
-                    }
+                    LogDebug($"Player info - Name: {playerInfo.Name}, SteamID: {playerInfo.SteamId}, Kills: {playerInfo.Kills}, Deaths: {playerInfo.Deaths}, Assists: {playerInfo.Assists}, Headshots: {playerInfo.Headshots}");
+                    Server.NextFrame(() => SendServerInfo(playerInfo).ConfigureAwait(false));
                 }
-                LogDebug($"Updated player info for player: {playerInfo.Name}");
+            }
+            else
+            {
+                LogDebug("No players on the server.");
+                Server.NextFrame(() => SendServerInfo().ConfigureAwait(false));
             }
             LogDebug("All player info updated.");
         }
@@ -312,14 +296,13 @@ namespace ServerInfo
             return (t1score, t2score);
         }
 
-        private void SendServerInfo(PlayerInfo playerinfo)
+        private async Task SendServerInfo(PlayerInfo? playerinfo = null)
         {
             LogDebug("Preparing to send server info...");
             if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(url) || string.IsNullOrEmpty(password))
             {
                 return;
             }
-            LogDebug($"Server info for player {playerinfo.Name} prepared for sending.");
 
             List<object> jsonPlayers;
             if (playerinfo != null)
@@ -335,7 +318,7 @@ namespace ServerInfo
             var jsonData = new { score_ct = t1score, score_t = t2score, players = jsonPlayers };
             var jsonString = System.Text.Json.JsonSerializer.Serialize(jsonData);
 
-            Task.Run(async () => await PostData(jsonString)).Wait();
+            await PostData(jsonString);
             LogDebug("Server info sent.");
         }
 
