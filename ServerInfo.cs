@@ -7,6 +7,8 @@ using CounterStrikeSharp.API.Core.Attributes.Registration;
 using MySqlConnector;
 using Newtonsoft.Json;
 using CounterStrikeSharp.API.Modules.Timers;
+using CounterStrikeSharp.API.Modules.Entities;
+using System.ComponentModel.DataAnnotations;
 
 namespace ServerInfo
 {
@@ -14,41 +16,107 @@ namespace ServerInfo
     {
         public override string ModuleName => "ServerInfo for LR WEB";
         public override string ModuleAuthor => "E!N";
-        public override string ModuleVersion => "1.4";
+        public override string ModuleVersion => "1.4.1";
 
         private bool isDebugMode = false;
 
         private const int MaxPlayers = 65;
-        private string server = "";
-        private string password = "";
-        private string url = "";
+        public string Server { get; private set; } = "";
+        public string Password { get; private set; } = "";
+        public string Url { get; private set; } = "";
         private float timerInterval = 40.0f;
-        private int statistic_type = 0;
+        private int statisticType = 0;
 
-        public Dictionary<int, PlayerInfo> PlayerList { get; set; } = new();
+        private const long SteamId64Base = 76561197960265728;
+        private const string LogPrefix = "ServerInfo |";
+        private const string TeamCT = "CT";
+        private const string TeamTerrorist = "TERRORIST";
+        private readonly HttpClient httpClient = new()
+        {
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+        private readonly Dictionary<string, int> rankCache = new Dictionary<string, int>();
+        public Dictionary<int, PlayerInfo> PlayerList { get; private set; } = new Dictionary<int, PlayerInfo>();
 
         public override void Load(bool hotReload)
         {
             LoadCfg();
-            var ip = GetIP();
-            AddCommand("css_getserverinfo", "Get server info", (player, info) => UpdatePlayerInfo());
-            AddCommand("css_reloadserverinfo", "Forced to read the cfg", (player, info) => LoadCfg());
-            AddTimer(timerInterval, () => UpdatePlayerInfo(), TimerFlags.REPEAT);
+            GetIP();
+            AddServerInfoCommands();
+            ScheduleRegularUpdates();
 
+            RegisterClientAuthListener();
+        }
+
+        private void AddServerInfoCommands()
+        {
+            AddCommand("css_getserverinfo", "Get server info",
+                (player, info) => Task.Run(async () => await UpdatePlayerInfoAsync()));
+
+            AddCommand("css_reloadserverinfo", "Forced to read the cfg",
+                (player, info) => LoadCfg());
+        }
+
+        private void ScheduleRegularUpdates()
+        {
+            AddTimer(timerInterval,
+                () => Task.Run(async () => await UpdatePlayerInfoAsync()), TimerFlags.REPEAT);
+        }
+
+        private void RegisterClientAuthListener()
+        {
+            LogDebug("Registering client authorization listener...");
             RegisterListener<Listeners.OnClientAuthorized>((slot, steamid) =>
             {
-                CCSPlayerController? player = Utilities.GetPlayerFromSlot(slot);
-                if (!IsPlayerValid(player)) return;
-                AddTimer(1.0f, () =>
-                {
-                    InitPlayers(player);
-                    if (PlayerList.TryGetValue(player.Slot, out var playerInfo))
-                    {
-                        playerInfo.SessionStartTime = DateTime.Now;
-                    }
-                });
-                LogDebug("Player authorized: " + steamid);
+                LogDebug($"Client authorized event triggered. Slot: {slot}, SteamID: {steamid}");
+                HandleClientAuthorization(slot, steamid);
             });
+            LogDebug("Client authorization listener registered successfully.");
+        }
+
+        private void HandleClientAuthorization(int slot, SteamID steamid)
+        {
+            LogDebug($"Handling client authorization for slot {slot}, SteamID: {steamid}");
+            CCSPlayerController? player = Utilities.GetPlayerFromSlot(slot);
+
+            if (!IsPlayerValid(player))
+            {
+                LogDebug($"Invalid player in slot {slot}. Authorization skipped.");
+                return;
+            }
+
+            LogDebug($"Valid player found in slot {slot}. Proceeding with session initialization.");
+            Task.Run(() =>
+            {
+                CounterStrikeSharp.API.Server.NextFrame(() => InitPlayerSession(player, steamid));
+            });
+        }
+
+        private void InitPlayerSession(CCSPlayerController player, SteamID steamid)
+        {
+            if (!PlayerList.TryGetValue(player.Slot, out PlayerInfo? playerInfo))
+            {
+                var steamId2 = player.AuthorizedSteamID != null
+                    ? ConvertToSteam2((long)player.AuthorizedSteamID.SteamId64)
+                    : null;
+
+                playerInfo = new PlayerInfo
+                {
+                    UserId = player.UserId,
+                    SteamId = player.AuthorizedSteamID?.SteamId64.ToString(),
+                    SteamId2 = steamId2,
+                    Name = player.PlayerName,
+                    SessionStartTime = DateTime.Now,
+                };
+
+                PlayerList[player.Slot] = playerInfo;
+                LogDebug($"Initialized new PlayerInfo for {player.PlayerName} with SessionStartTime: {playerInfo.SessionStartTime}");
+            }
+            else
+            {
+                UpdatePlayerStats(player, playerInfo);
+                LogDebug($"Updated PlayerInfo for {player.PlayerName}");
+            }
         }
 
         private void LoadCfg()
@@ -56,27 +124,66 @@ namespace ServerInfo
             try
             {
                 var filePath = GetConfigFilePath();
-                if (File.Exists(filePath))
+                if (CheckConfigFileExists(filePath))
                 {
-                    ParseConfigFile(filePath);
+                    ParseAndLoadConfig(filePath);
                 }
                 else
                 {
-                    Console.WriteLine("Config file not found.");
+                    LogConfigFileNotFound();
                 }
-                LogDebug("Configuration loaded successfully.");
             }
             catch (Exception ex)
             {
-                LogDebug($"Error loading configuration: {ex.Message}");
+                LogConfigLoadError(ex);
             }
+        }
+
+        private bool CheckConfigFileExists(string filePath)
+        {
+            if (!File.Exists(filePath))
+            {
+                Console.WriteLine("Config file not found.");
+                return false;
+            }
+            return true;
+        }
+
+        private void ParseAndLoadConfig(string filePath)
+        {
+            ParseConfigFile(filePath);
+            LogDebug("Configuration loaded successfully.");
+        }
+
+        private void LogConfigFileNotFound()
+        {
+            LogDebug("Configuration file not found.");
+        }
+
+        private void LogConfigLoadError(Exception ex)
+        {
+            LogDebug($"Error loading configuration: {ex.Message}");
         }
 
         private string GetConfigFilePath()
         {
-            var moduleDirectoryParent = Directory.GetParent(ModuleDirectory) ?? throw new InvalidOperationException("Module directory parent is null");
-            var parentDirectory = moduleDirectoryParent.Parent ?? throw new InvalidOperationException("Parent directory is null");
-            return Path.Combine(parentDirectory.FullName, "configs/server_info.ini");
+            try
+            {
+                var moduleDirectoryParent = GetParentDirectory(ModuleDirectory, "Module directory");
+                var parentDirectory = GetParentDirectory(moduleDirectoryParent.FullName, "Module directory parent");
+                return Path.Combine(parentDirectory.FullName, "configs/server_info.ini");
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"Error getting config file path: {ex.Message}");
+                throw;
+            }
+        }
+
+        private DirectoryInfo GetParentDirectory(string directoryPath, string directoryName)
+        {
+            var parentDirectory = Directory.GetParent(directoryPath);
+            return parentDirectory ?? throw new InvalidOperationException($"{directoryName} parent is null");
         }
 
         private void ParseConfigFile(string filePath)
@@ -93,47 +200,91 @@ namespace ServerInfo
                     continue;
                 }
 
+                if (insideServerBlock && line.Contains('}'))
+                {
+                    insideServerBlock = false;
+                    continue;
+                }
+
                 if (insideServerBlock)
                 {
-                    if (line.Contains('}'))
-                    {
-                        insideServerBlock = false;
-                        continue;
-                    }
-
-                    var match = MyRegex().Match(line);
-                    if (match.Success && match.Groups.Count == 3)
-                    {
-                        var key = match.Groups[1].Value.Trim();
-                        var value = match.Groups[2].Value.Trim();
-
-                        if (key == "server_info") server = value;
-                        else if (key == "password") password = value;
-                        else if (key == "url") url = value;
-                        else if (key == "timer_interval" && float.TryParse(value, out float interval)) timerInterval = interval;
-                        else if (key == "debug_mode") isDebugMode = value.ToLower() == "true";
-                        else if (key == "statistic_type" && int.TryParse(value, out int type)) statistic_type = type;
-                        LogDebug($"Parsed key: {key}, value: {value}");
-
-                    }
+                    ProcessConfigLine(line);
                 }
             }
             LogDebug("Configuration file parsed successfully.");
         }
 
+        private void ProcessConfigLine(string line)
+        {
+            var match = ConfigLineRegex().Match(line);
+            if (!match.Success || match.Groups.Count != 3) return;
+
+            var key = match.Groups[1].Value.Trim();
+            var value = match.Groups[2].Value.Trim();
+
+            switch (key)
+            {
+                case "server_info":
+                    Server = value;
+                    break;
+                case "password":
+                    Password = value;
+                    break;
+                case "url":
+                    Url = value;
+                    break;
+                case "timer_interval":
+                    if (float.TryParse(value, out float interval)) timerInterval = interval;
+                    break;
+                case "debug_mode":
+                    isDebugMode = value.ToLower() == "true";
+                    break;
+                case "statistic_type":
+                    if (int.TryParse(value, out int type)) statisticType = type;
+                    break;
+            }
+            LogDebug($"Parsed key: {key}, value: {value}");
+        }
+
         private string GetIP()
         {
             LogDebug("Fetching server IP and port...");
-            var serverIp = ConVar.Find("ip")?.StringValue ?? "Unknown IP";
-            var serverPort = ConVar.Find("hostport")?.GetPrimitiveValue<int>().ToString() ?? "Unknown Port";
-            string ipPort = $"{serverIp}:{serverPort}";
-            LogDebug($"Server IP and port: {ipPort}");
-            return ipPort;
+            try
+            {
+                var serverIp = GetServerIP();
+                var serverPort = GetServerPort();
+                string ipPort = $"{serverIp}:{serverPort}";
+                LogDebug($"Server IP and port: {ipPort}");
+                return ipPort;
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"Error fetching server IP and port: {ex.Message}");
+                return "Unknown IP:Unknown Port";
+            }
         }
 
-        public int GetRankFromDatabase(string? steamid)
+        private string GetServerIP()
+        {
+            return ConVar.Find("ip")?.StringValue ?? "Unknown IP";
+        }
+
+        private string GetServerPort()
+        {
+            return ConVar.Find("hostport")?.GetPrimitiveValue<int>().ToString() ?? "Unknown Port";
+        }
+
+
+
+        public async Task<int> GetRankFromDatabaseAsync(string? steamid)
         {
             LogDebug("Fetching rank from database for Steam ID: " + steamid);
+
+            if (steamid != null && rankCache.TryGetValue(steamid, out int cachedRank))
+            {
+                LogDebug($"Rank for {steamid} fetched from cache: {cachedRank}");
+                return cachedRank;
+            }
 
             var dbConfig = LoadDbConfig();
             if (dbConfig == null)
@@ -142,110 +293,140 @@ namespace ServerInfo
                 return 0;
             }
 
-            var connectionString = new MySqlConnectionStringBuilder
-            {
-                Server = dbConfig.DbHost,
-                UserID = dbConfig.DbUser,
-                Password = dbConfig.DbPassword,
-                Database = dbConfig.DbName,
-                Port = uint.Parse(dbConfig.DbPort),
-            }.ToString();
-
-            using var connection = new MySqlConnection(connectionString);
             try
             {
-                connection.Open();
-
-                var query = $"SELECT rank FROM {dbConfig.Name} WHERE steam = @SteamId";
-                using var command = new MySqlCommand(query, connection);
-                command.Parameters.AddWithValue("@SteamId", steamid);
-                var result = command.ExecuteScalar();
-                if (result != null)
+                int rank = await ExecuteRankQueryAsync(steamid, dbConfig);
+                if (steamid != null)
                 {
-                    LogDebug("Rank fetched successfully: " + result);
-                    return Convert.ToInt32(result);
+                    rankCache[steamid] = rank;
                 }
+                return rank;
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error when connecting to the database: " + ex.Message);
-                LogDebug("Database connection error: " + ex.Message);
+                LogDatabaseError(ex);
+                return 0;
+            }
+        }
+
+        private async Task<int> ExecuteRankQueryAsync(string? steamid, DbConfig dbConfig)
+        {
+            var connectionString = BuildConnectionString(dbConfig);
+            using var connection = new MySqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            var query = $"SELECT rank FROM {dbConfig.Name} WHERE steam = @SteamId";
+            using var command = new MySqlCommand(query, connection);
+            command.Parameters.AddWithValue("@SteamId", steamid);
+            var result = await command.ExecuteScalarAsync();
+
+            if (result != null)
+            {
+                LogDebug("Rank fetched successfully: " + result);
+                return Convert.ToInt32(result);
             }
 
             return 0;
         }
 
-        private DbConfig? LoadDbConfig()
+        private string BuildConnectionString(DbConfig dbConfig)
         {
-            string configFilePath;
-            switch (statistic_type)
+            if (!uint.TryParse(dbConfig.DbPort, out uint port))
             {
-                case 1:
-                    configFilePath = Path.Combine(Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "", "plugins/RanksPoints/dbconfig.json");
-                    break;
-                case 2:
-                    configFilePath = Path.Combine(Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "", "plugins/Ranks/settings_ranks.json");
-                    break;
-                //case 3:
-                //    configFilePath = ""; TO DO: LevelsRanks
-                //    break;
-                default:
-                    LogDebug("Database not configured or disabled.");
-                    return null;
+                throw new ArgumentException("Invalid port number.");
             }
 
-            if (File.Exists(configFilePath))
+            return new MySqlConnectionStringBuilder
             {
-                LogDebug("Loading dbconfig from: " + configFilePath);
-                return JsonConvert.DeserializeObject<DbConfig>(File.ReadAllText(configFilePath));
+                Server = dbConfig.DbHost,
+                UserID = dbConfig.DbUser,
+                Password = dbConfig.DbPassword,
+                Database = dbConfig.DbName,
+                Port = port
+            }.ToString();
+        }
+
+        private void LogDatabaseError(Exception ex)
+        {
+            Console.WriteLine("Error when connecting to the database: " + ex.Message);
+            LogDebug("Database connection error: " + ex.Message);
+        }
+
+        private DbConfig? LoadDbConfig()
+        {
+            var configFilePath = GetConfigFilePathForType(statisticType);
+
+            if (string.IsNullOrEmpty(configFilePath))
+            {
+                LogDebug("Database not configured or disabled.");
+                return null;
             }
-            else
+
+            if (!File.Exists(configFilePath))
             {
                 LogDebug("Dbconfig not found at: " + configFilePath);
                 return null;
             }
+
+            try
+            {
+                LogDebug("Loading dbconfig from: " + configFilePath);
+                var configJson = File.ReadAllText(configFilePath);
+                return JsonConvert.DeserializeObject<DbConfig>(configJson);
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"Error loading dbconfig from {configFilePath}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private string GetConfigFilePathForType(int type)
+        {
+            var parentDirectory = Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "";
+
+            return type switch
+            {
+                1 => Path.Combine(parentDirectory, "plugins/RanksPoints/dbconfig.json"),
+                2 => Path.Combine(parentDirectory, "plugins/Ranks/settings_ranks.json"),
+                //case 3: return ""; TO DO: LevelsRanks
+                _ => "",
+            };
+        }
+
+        [GameEventHandler]
+        public HookResult OnPlayerConnect(EventPlayerConnectFull @event, GameEventInfo info)
+        {
+            var player = @event.Userid;
+
+            if (!IsPlayerValid(player)) return HookResult.Continue;
+
+            if (player.AuthorizedSteamID != null)
+            {
+                InitPlayerSession(player, player.AuthorizedSteamID);
+            }
+            else
+            {
+                LogDebug("Player's AuthorizedSteamID is null. Player session initialization skipped.");
+            }
+
+            return HookResult.Continue;
         }
 
         [GameEventHandler]
         public HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
         {
-            CCSPlayerController _player = @event.Userid;
-            if (!IsPlayerValid(_player)) return HookResult.Continue;
-            PlayerList.Remove(_player.Slot);
-            LogDebug("Player disconnected: " + _player.UserId);
+            var player = @event.Userid;
+            if (!IsPlayerValid(player)) return HookResult.Continue;
+
+            PlayerList.Remove(player.Slot);
+            LogDebug($"Player disconnected: {player.UserId}");
             return HookResult.Continue;
-        }
-
-        public void InitPlayers(CCSPlayerController player)
-        {
-            if (!IsPlayerValid(player)) return;
-            LogDebug($"Initializing player with slot {player.Slot}");
-
-            string? steamId2 = null;
-            if (player.AuthorizedSteamID != null)
-            {
-                steamId2 = ConvertToSteam2((long)player.AuthorizedSteamID.SteamId64);
-            }
-
-            PlayerInfo playerInfo = new()
-            {
-                UserId = player.UserId,
-                SteamId = player.AuthorizedSteamID?.SteamId64.ToString(),
-                SteamId2 = steamId2,
-                Name = player.PlayerName,
-                Kills = player.ActionTrackingServices?.MatchStats.Kills ?? 0,
-                Deaths = player.ActionTrackingServices?.MatchStats.Deaths ?? 0,
-                Assists = player.ActionTrackingServices?.MatchStats.Assists ?? 0,
-                Headshots = player.ActionTrackingServices?.MatchStats.HeadShotKills ?? 0
-            };
-
-            PlayerList[player.Slot] = playerInfo;
-            LogDebug($"Player initialized: {playerInfo.Name}");
         }
 
         private string ConvertToSteam2(long steamId64)
         {
-            long steamId3 = steamId64 - 76561197960265728;
+            long steamId3 = steamId64 - SteamId64Base;
             int y = (int)(steamId3 % 2);
             long z = steamId3 / 2;
 
@@ -254,68 +435,112 @@ namespace ServerInfo
 
         private int CalculatePlayTime(PlayerInfo playerInfo)
         {
+            if (playerInfo == null)
+            {
+                LogDebug("Player info is null.");
+                return 0;
+            }
+
             LogDebug($"Calculating play time for player: {playerInfo.Name}");
-            TimeSpan timeSpent = DateTime.Now - playerInfo.SessionStartTime;
-            int playTime = (int)timeSpent.TotalSeconds;
-            LogDebug($"Play time for {playerInfo.Name}: {playTime} seconds");
-            return playTime;
+            var currentTime = DateTime.Now;
+            LogDebug($"Current time: {currentTime}, SessionStartTime: {playerInfo.SessionStartTime}");
+
+            if (currentTime < playerInfo.SessionStartTime)
+            {
+                LogDebug($"Current time is earlier than the session start time for {playerInfo.Name}.");
+                return 0;
+            }
+
+            TimeSpan timeSpent = currentTime - playerInfo.SessionStartTime;
+            if (timeSpent.TotalSeconds > int.MaxValue)
+            {
+                LogDebug($"Play time overflow for {playerInfo.Name}.");
+                return int.MaxValue;
+            }
+
+            int playTimeInSeconds = (int)timeSpent.TotalSeconds;
+            LogDebug($"Play time for {playerInfo.Name}: {playTimeInSeconds} seconds");
+            return playTimeInSeconds;
         }
 
         private void LogDebug(string message)
         {
             if (isDebugMode)
             {
-                Console.WriteLine(" ServerInfo | " + message);
+                Console.WriteLine($"{DateTime.Now} | {LogPrefix} {message}");
             }
         }
 
-        private void UpdatePlayerInfo()
+        private async Task UpdatePlayerInfoAsync()
         {
             LogDebug("Updating player info for all players...");
-            if (PlayerList.Any())
-            {
-                foreach (var playerInfo in PlayerList.Values)
-                {
-                    LogDebug($"Player info - Name: {playerInfo.Name}, SteamID: {playerInfo.SteamId}, Kills: {playerInfo.Kills}, Deaths: {playerInfo.Deaths}, Assists: {playerInfo.Assists}, Headshots: {playerInfo.Headshots}");
-                    Server.NextFrame(() => SendServerInfo(playerInfo).ConfigureAwait(false));
-                }
-            }
-            else
+
+            if (!PlayerList.Any())
             {
                 LogDebug("No players on the server.");
-                Server.NextFrame(() => SendServerInfo().ConfigureAwait(false));
+                await Task.Run(() => CounterStrikeSharp.API.Server.NextFrame(() => SendServerInfoAsync().Wait()));
+                return;
             }
+
+            foreach (var playerSlot in PlayerList.Keys.ToList())
+            {
+                CCSPlayerController? player = null;
+                var resetEvent = new ManualResetEvent(false);
+
+                await Task.Run(() => CounterStrikeSharp.API.Server.NextFrame(() =>
+                {
+                    player = Utilities.GetPlayerFromSlot(playerSlot);
+                    resetEvent.Set();
+                }));
+
+                resetEvent.WaitOne();
+
+                if (player == null || !IsPlayerValid(player)) continue;
+
+                var playerInfo = PlayerList[playerSlot];
+                await Task.Run(() => CounterStrikeSharp.API.Server.NextFrame(() => UpdatePlayerStats(player, playerInfo)));
+                LogPlayerInfo(playerInfo);
+
+                CounterStrikeSharp.API.Server.NextFrame(() => SendServerInfoAsync(playerInfo).Wait());
+            }
+
             LogDebug("All player info updated.");
         }
 
-        private static (int t1score, int t2score) GetTeamsScore()
+        private void UpdatePlayerStats(CCSPlayerController player, PlayerInfo playerInfo)
         {
-            var teamEntities = Utilities.FindAllEntitiesByDesignerName<CCSTeam>("cs_team_manager");
-            var t1score = teamEntities.FirstOrDefault(t => t.Teamname == "CT")?.Score ?? 0;
-            var t2score = teamEntities.FirstOrDefault(t => t.Teamname == "TERRORIST")?.Score ?? 0;
-            return (t1score, t2score);
+            playerInfo.Name = player.PlayerName;
+            playerInfo.Kills = player.ActionTrackingServices?.MatchStats.Kills;
+            playerInfo.Deaths = player.ActionTrackingServices?.MatchStats.Deaths;
+            playerInfo.Assists = player.ActionTrackingServices?.MatchStats.Assists;
+            playerInfo.Headshots = player.ActionTrackingServices?.MatchStats.HeadShotKills;
         }
 
-        private async Task SendServerInfo(PlayerInfo? playerinfo = null)
+        private void LogPlayerInfo(PlayerInfo playerInfo)
+        {
+            LogDebug($"Player info - Name: {playerInfo.Name}, SteamID: {playerInfo.SteamId}, Kills: {playerInfo.Kills}, Deaths: {playerInfo.Deaths}, Assists: {playerInfo.Assists}, Headshots: {playerInfo.Headshots}");
+        }
+
+        private static (int ctScore, int terroristScore) GetTeamsScore()
+        {
+            var teamEntities = Utilities.FindAllEntitiesByDesignerName<CCSTeam>("cs_team_manager");
+            var ctScore = teamEntities.FirstOrDefault(t => t.Teamname == TeamCT)?.Score ?? 0;
+            var terroristScore = teamEntities.FirstOrDefault(t => t.Teamname == TeamTerrorist)?.Score ?? 0;
+
+            return (ctScore, terroristScore);
+        }
+
+        private async Task SendServerInfoAsync(PlayerInfo? playerinfo = null)
         {
             LogDebug("Preparing to send server info...");
-            if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(url) || string.IsNullOrEmpty(password))
+            if (string.IsNullOrEmpty(Server) || string.IsNullOrEmpty(Url) || string.IsNullOrEmpty(Password))
             {
                 return;
             }
 
-            List<object> jsonPlayers;
-            if (playerinfo != null)
-            {
-                jsonPlayers = GetPlayersJson(playerinfo);
-            }
-            else
-            {
-                jsonPlayers = new List<object>();
-            }
-
-            var (t1score, t2score) = GetTeamsScore();
-            var jsonData = new { score_ct = t1score, score_t = t2score, players = jsonPlayers };
+            var jsonPlayers = playerinfo != null ? GetPlayersJson(playerinfo) : new List<object>();
+            var (scoreCt, scoreT) = GetTeamsScore();
+            var jsonData = new { score_ct = scoreCt, score_t = scoreT, players = jsonPlayers };
             var jsonString = System.Text.Json.JsonSerializer.Serialize(jsonData);
 
             await PostData(jsonString);
@@ -325,59 +550,63 @@ namespace ServerInfo
         private List<object> GetPlayersJson(PlayerInfo playerinfo)
         {
             var playTime = CalculatePlayTime(playerinfo);
-            var jsonPlayers = new List<object>
+            int rank = GetRankFromDatabaseAsync(playerinfo.SteamId2).Result;
+            var playerJson = new
             {
-                new
-                {
-                    name = playerinfo.Name ?? "Unknown",
-                    steamid = playerinfo.SteamId?.ToString(),
-                    kills = playerinfo.Kills.ToString(),
-                    assists = playerinfo.Deaths.ToString(),
-                    death = playerinfo.Assists.ToString(),
-                    headshots = playerinfo.Headshots.ToString(),
-                    rank = GetRankFromDatabase(playerinfo.SteamId2),
-                    playtime = playTime
-                }
+                name = playerinfo.Name ?? "Unknown",
+                steamid = playerinfo?.SteamId,
+                kills = playerinfo?.Kills,
+                assists = playerinfo?.Assists,
+                death = playerinfo?.Deaths,
+                headshots = playerinfo?.Headshots,
+                rank,
+                playtime = playTime
             };
-            return jsonPlayers;
+
+            return new List<object> { playerJson };
         }
 
         private async Task PostData(string jsonData)
         {
             LogDebug("Sending data to server...");
-            var request = new HttpRequestMessage(HttpMethod.Post, $"{url}/app/modules/module_block_main_monitoring_rating/forward/js_controller.php?server={server}&password={password}")
+            var requestUri = $"{Url}/app/modules/module_block_main_monitoring_rating/forward/js_controller.php?server={Server}&password={Password}";
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
             {
                 Content = new StringContent(jsonData, Encoding.UTF8, "application/json")
             };
 
-            using var httpClient = new HttpClient();
             try
             {
                 var response = await httpClient.SendAsync(request);
                 var responseContent = await response.Content.ReadAsStringAsync();
 
+                LogDebug($"Response status: {response.StatusCode}. Data sent. Response: {responseContent}");
+
                 if (!response.IsSuccessStatusCode)
                 {
-                    Console.WriteLine("Error when sending a request.");
+                    LogDebug("Error when sending a request: " + responseContent);
+                    return;
                 }
-                LogDebug("Data sent. Response: " + responseContent);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Exception in HTTP request: {ex.Message}");
+                LogDebug($"Exception in HTTP request: {ex.Message}");
             }
         }
 
         public static bool IsPlayerValid(CCSPlayerController? player)
         {
-            return (player is
+            return player is
             {
-                IsValid: true, IsBot: false, IsHLTV: false
-            }); ;
+                Pawn.IsValid: true,
+                IsBot: false,
+                IsHLTV: false
+            };
         }
 
         [GeneratedRegex("\"([^\"]+)\"\\s+\"([^\"]+)\"")]
-        private static partial Regex MyRegex();
+        private static partial Regex ConfigLineRegex();
     }
 
     public class PlayerInfo
@@ -395,25 +624,37 @@ namespace ServerInfo
 
     public class DbConfig
     {
-        public required string DbHost { get; set; }
-        public required string DbUser { get; set; }
-        public required string DbPassword { get; set; }
-        public required string DbName { get; set; }
-        public required string DbPort { get; set; }
-        public required string Name { get; set; }
+        [Required]
+        public string? DbHost { get; set; }
+        [Required]
+        public string? DbUser { get; set; }
+        [Required]
+        public string? DbPassword { get; set; }
+        [Required]
+        public string? DbName { get; set; }
+        [Required]
+        public string? DbPort { get; set; }
+        [Required]
+        public string? Name { get; set; }
     }
 
     public class AlternativeConfig
     {
-        public required string TableName { get; set; }
-        public required ConnectionConfig Connection { get; set; }
+        [Required]
+        public string? TableName { get; set; }
+        [Required]
+        public ConnectionConfig? Connection { get; set; }
     }
 
     public class ConnectionConfig
     {
-        public required string Host { get; set; }
-        public required string Database { get; set; }
-        public required string User { get; set; }
-        public required string Password { get; set; }
+        [Required]
+        public string? Host { get; set; }
+        [Required]
+        public string? Database { get; set; }
+        [Required]
+        public string? User { get; set; }
+        [Required]
+        public string? Password { get; set; }
     }
 }
