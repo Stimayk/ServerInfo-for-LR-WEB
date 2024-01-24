@@ -16,7 +16,8 @@ namespace ServerInfo
     {
         public override string ModuleName => "ServerInfo for LR WEB";
         public override string ModuleAuthor => "E!N";
-        public override string ModuleVersion => "1.4.1";
+        public override string ModuleVersion => "1.4.2";
+        public override string ModuleDescription => "Server side plugin for Module Monitoring Rich (https://discord.com/invite/sYKAk3GCbD)";
 
         private bool isDebugMode = false;
 
@@ -35,7 +36,7 @@ namespace ServerInfo
         {
             Timeout = TimeSpan.FromSeconds(10)
         };
-        private readonly Dictionary<string, int> rankCache = new Dictionary<string, int>();
+        private readonly Dictionary<string, int> rankCache = new();
         public Dictionary<int, PlayerInfo> PlayerList { get; private set; } = new Dictionary<int, PlayerInfo>();
 
         public override void Load(bool hotReload)
@@ -333,7 +334,8 @@ namespace ServerInfo
         {
             if (!uint.TryParse(dbConfig.DbPort, out uint port))
             {
-                throw new ArgumentException("Invalid port number.");
+                LogDebug($"Invalid or missing port number in configuration: {dbConfig.DbPort}. Using default port 3306.");
+                port = 3306;
             }
 
             return new MySqlConnectionStringBuilder
@@ -354,8 +356,22 @@ namespace ServerInfo
 
         private DbConfig? LoadDbConfig()
         {
-            var configFilePath = GetConfigFilePathForType(statisticType);
+            switch (statisticType)
+            {
+                case 1:
+                    return LoadDbConfigForType1(GetConfigFilePathForType(1));
+                case 2:
+                    return LoadDbConfigForType2();
+                case 3:
+                    return LoadDbConfigForType3();
+                default:
+                    LogDebug("Unknown statistic type: " + statisticType);
+                    return null;
+            }
+        }
 
+        private DbConfig? LoadDbConfigForType1(string configFilePath)
+        {
             if (string.IsNullOrEmpty(configFilePath))
             {
                 LogDebug("Database not configured or disabled.");
@@ -381,15 +397,119 @@ namespace ServerInfo
             }
         }
 
+        private DbConfig? LoadDbConfigForType2()
+        {
+            try
+            {
+                var configFilePath = GetConfigFilePathForType(2);
+
+                if (!File.Exists(configFilePath))
+                {
+                    LogDebug("Dbconfig for type 2 not found at: " + configFilePath);
+                    return null;
+                }
+
+                var configJson = File.ReadAllText(configFilePath);
+                var configData = JsonConvert.DeserializeObject<AlternativeConfig>(configJson);
+
+                if (configData?.Connection == null)
+                {
+                    LogDebug("Database connection details are missing in type 2 config.");
+                    return null;
+                }
+
+                return new DbConfig
+                {
+                    DbHost = configData.Connection.Host,
+                    DbUser = configData.Connection.User,
+                    DbPassword = configData.Connection.Password,
+                    DbName = configData.Connection.Database,
+                    DbPort = configData.Connection.Port.ToString()
+                };
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"Error loading dbconfig for type 2: {ex.Message}");
+                return null;
+            }
+        }
+
+        private DbConfig? LoadDbConfigForType3()
+        {
+            var configFilePath = GetConfigFilePathForType(3);
+            if (!File.Exists(configFilePath))
+            {
+                LogDebug("databases.cfg not found at: " + configFilePath);
+                return null;
+            }
+
+            try
+            {
+                var lines = File.ReadAllLines(configFilePath);
+                var isLevelsRanksSection = false;
+                var dbConfig = new DbConfig();
+
+                foreach (var line in lines)
+                {
+                    var trimmedLine = line.Trim();
+
+                    if (trimmedLine.StartsWith("\"levels_ranks\""))
+                    {
+                        isLevelsRanksSection = true;
+                        continue;
+                    }
+
+                    if (isLevelsRanksSection)
+                    {
+                        if (trimmedLine.StartsWith("{") || trimmedLine.StartsWith("}"))
+                        {
+                            continue;
+                        }
+
+                        var keyValue = trimmedLine.Split(new[] { '\"', '\"' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (keyValue.Length >= 2)
+                        {
+                            switch (keyValue[0].Trim())
+                            {
+                                case "host":
+                                    dbConfig.DbHost = keyValue[1];
+                                    break;
+                                case "user":
+                                    dbConfig.DbUser = keyValue[1];
+                                    break;
+                                case "pass":
+                                    dbConfig.DbPassword = keyValue[1];
+                                    break;
+                                case "database":
+                                    dbConfig.DbName = keyValue[1];
+                                    break;
+                                case "port":
+                                    dbConfig.DbPort = keyValue[1];
+                                    break;
+                            }
+                        }
+                    }
+                }
+
+                return dbConfig;
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"Error reading databases.cfg from {configFilePath}: {ex.Message}");
+                return null;
+            }
+        }
+
         private string GetConfigFilePathForType(int type)
         {
             var parentDirectory = Directory.GetParent(ModuleDirectory)?.Parent?.FullName ?? "";
+            var csgoDirectory = Directory.GetParent(parentDirectory)?.Parent?.Parent?.FullName ?? "";
 
             return type switch
             {
                 1 => Path.Combine(parentDirectory, "plugins/RanksPoints/dbconfig.json"),
                 2 => Path.Combine(parentDirectory, "plugins/Ranks/settings_ranks.json"),
-                //case 3: return ""; TO DO: LevelsRanks
+                3 => Path.Combine(csgoDirectory, "addons/configs/databases.cfg"),
                 _ => "",
             };
         }
@@ -482,6 +602,8 @@ namespace ServerInfo
                 return;
             }
 
+            var allPlayersJson = new List<object>();
+
             foreach (var playerSlot in PlayerList.Keys.ToList())
             {
                 CCSPlayerController? player = null;
@@ -501,9 +623,11 @@ namespace ServerInfo
                 await Task.Run(() => CounterStrikeSharp.API.Server.NextFrame(() => UpdatePlayerStats(player, playerInfo)));
                 LogPlayerInfo(playerInfo);
 
-                CounterStrikeSharp.API.Server.NextFrame(() => SendServerInfoAsync(playerInfo).Wait());
+                var playerJson = GetPlayersJson(playerInfo);
+                allPlayersJson.AddRange(playerJson);
             }
 
+            await SendServerInfoAsync(allPlayersJson);
             LogDebug("All player info updated.");
         }
 
@@ -530,7 +654,7 @@ namespace ServerInfo
             return (ctScore, terroristScore);
         }
 
-        private async Task SendServerInfoAsync(PlayerInfo? playerinfo = null)
+        private async Task SendServerInfoAsync(List<object>? playersJson = null)
         {
             LogDebug("Preparing to send server info...");
             if (string.IsNullOrEmpty(Server) || string.IsNullOrEmpty(Url) || string.IsNullOrEmpty(Password))
@@ -538,9 +662,19 @@ namespace ServerInfo
                 return;
             }
 
-            var jsonPlayers = playerinfo != null ? GetPlayersJson(playerinfo) : new List<object>();
-            var (scoreCt, scoreT) = GetTeamsScore();
-            var jsonData = new { score_ct = scoreCt, score_t = scoreT, players = jsonPlayers };
+            int scoreCt = 0;
+            int scoreT = 0;
+            var resetEvent = new ManualResetEvent(false);
+
+            await Task.Run(() => CounterStrikeSharp.API.Server.NextFrame(() =>
+            {
+                (scoreCt, scoreT) = GetTeamsScore();
+                resetEvent.Set();
+            }));
+
+            resetEvent.WaitOne();
+
+            var jsonData = new { score_ct = scoreCt, score_t = scoreT, players = playersJson ?? new List<object>() };
             var jsonString = System.Text.Json.JsonSerializer.Serialize(jsonData);
 
             await PostData(jsonString);
@@ -656,5 +790,6 @@ namespace ServerInfo
         public string? User { get; set; }
         [Required]
         public string? Password { get; set; }
+        public int Port { get; set; }
     }
 }
