@@ -1,14 +1,14 @@
-using CounterStrikeSharp.API.Core;
-using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API;
-using System.Text.RegularExpressions;
-using System.Text;
+using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
+using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Entities;
 using MySqlConnector;
 using Newtonsoft.Json;
-using CounterStrikeSharp.API.Modules.Timers;
-using CounterStrikeSharp.API.Modules.Entities;
+using Newtonsoft.Json.Linq;
 using System.ComponentModel.DataAnnotations;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace ServerInfo
 {
@@ -16,7 +16,7 @@ namespace ServerInfo
     {
         public override string ModuleName => "ServerInfo for LR WEB";
         public override string ModuleAuthor => "E!N";
-        public override string ModuleVersion => "1.4.2";
+        public override string ModuleVersion => "1.5";
         public override string ModuleDescription => "Server side plugin for Module Monitoring Rich (https://discord.com/invite/sYKAk3GCbD)";
 
         private bool isDebugMode = false;
@@ -25,7 +25,6 @@ namespace ServerInfo
         public string Server { get; private set; } = "";
         public string Password { get; private set; } = "";
         public string Url { get; private set; } = "";
-        private float timerInterval = 40.0f;
         private int statisticType = 0;
 
         private const long SteamId64Base = 76561197960265728;
@@ -44,7 +43,6 @@ namespace ServerInfo
             LoadCfg();
             GetIP();
             AddServerInfoCommands();
-            ScheduleRegularUpdates();
 
             RegisterClientAuthListener();
         }
@@ -56,12 +54,6 @@ namespace ServerInfo
 
             AddCommand("css_reloadserverinfo", "Forced to read the cfg",
                 (player, info) => LoadCfg());
-        }
-
-        private void ScheduleRegularUpdates()
-        {
-            AddTimer(timerInterval,
-                () => Task.Run(async () => await UpdatePlayerInfoAsync()), TimerFlags.REPEAT);
         }
 
         private void RegisterClientAuthListener()
@@ -234,9 +226,6 @@ namespace ServerInfo
                 case "url":
                     Url = value;
                     break;
-                case "timer_interval":
-                    if (float.TryParse(value, out float interval)) timerInterval = interval;
-                    break;
                 case "debug_mode":
                     isDebugMode = value.ToLower() == "true";
                     break;
@@ -274,8 +263,6 @@ namespace ServerInfo
         {
             return ConVar.Find("hostport")?.GetPrimitiveValue<int>().ToString() ?? "Unknown Port";
         }
-
-
 
         public async Task<int> GetRankFromDatabaseAsync(string? steamid)
         {
@@ -361,9 +348,9 @@ namespace ServerInfo
                 case 1:
                     return LoadDbConfigForType1(GetConfigFilePathForType(1));
                 case 2:
-                    return LoadDbConfigForType2();
+                    return LoadDbConfigForType2(GetConfigFilePathForType(2));
                 case 3:
-                    return LoadDbConfigForType3();
+                    return LoadDbConfigForType3(GetConfigFilePathForType(3));
                 default:
                     LogDebug("Unknown statistic type: " + statisticType);
                     return null;
@@ -397,46 +384,54 @@ namespace ServerInfo
             }
         }
 
-        private DbConfig? LoadDbConfigForType2()
+        private DbConfig? LoadDbConfigForType2(string configFilePath)
         {
+            if (!File.Exists(configFilePath))
+            {
+                LogDebug("Dbconfig for type 2 not found at: " + configFilePath);
+                return null;
+            }
+
             try
             {
-                var configFilePath = GetConfigFilePathForType(2);
+                LogDebug("Loading dbconfig for type 2 from: " + configFilePath);
+                var configJson = File.ReadAllText(configFilePath);
+                var configObject = JsonConvert.DeserializeObject<JObject>(configJson);
 
-                if (!File.Exists(configFilePath))
+                if (configObject == null)
                 {
-                    LogDebug("Dbconfig for type 2 not found at: " + configFilePath);
+                    LogDebug("Failed to deserialize JSON for dbconfig type 2.");
                     return null;
                 }
 
-                var configJson = File.ReadAllText(configFilePath);
-                var configData = JsonConvert.DeserializeObject<AlternativeConfig>(configJson);
+                var connectionConfig = configObject["Connection"];
+                var tableName = configObject["TableName"]?.ToString();
 
-                if (configData?.Connection == null)
+                if (connectionConfig == null || tableName == null)
                 {
-                    LogDebug("Database connection details are missing in type 2 config.");
+                    LogDebug("Connection or TableName is missing in dbconfig for type 2.");
                     return null;
                 }
 
                 return new DbConfig
                 {
-                    DbHost = configData.Connection.Host,
-                    DbUser = configData.Connection.User,
-                    DbPassword = configData.Connection.Password,
-                    DbName = configData.Connection.Database,
-                    DbPort = configData.Connection.Port.ToString()
+                    DbHost = connectionConfig["Host"]?.ToString(),
+                    DbUser = connectionConfig["User"]?.ToString(),
+                    DbPassword = connectionConfig["Password"]?.ToString(),
+                    DbName = connectionConfig["Database"]?.ToString(),
+                    DbPort = connectionConfig["Port"]?.ToString(),
+                    Name = tableName
                 };
             }
             catch (Exception ex)
             {
-                LogDebug($"Error loading dbconfig for type 2: {ex.Message}");
+                LogDebug($"Error loading dbconfig for type 2 from {configFilePath}: {ex.Message}");
                 return null;
             }
         }
 
-        private DbConfig? LoadDbConfigForType3()
+        private DbConfig? LoadDbConfigForType3(string configFilePath)
         {
-            var configFilePath = GetConfigFilePathForType(3);
             if (!File.Exists(configFilePath))
             {
                 LogDebug("databases.cfg not found at: " + configFilePath);
@@ -512,6 +507,17 @@ namespace ServerInfo
                 3 => Path.Combine(csgoDirectory, "addons/configs/databases.cfg"),
                 _ => "",
             };
+        }
+
+        [GameEventHandler]
+        public HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
+        {
+            Task.Run(() => CounterStrikeSharp.API.Server.NextFrame(async () =>
+            {
+                await UpdatePlayerInfoAsync();
+            }));
+
+            return HookResult.Continue;
         }
 
         [GameEventHandler]
@@ -659,6 +665,12 @@ namespace ServerInfo
             LogDebug("Preparing to send server info...");
             if (string.IsNullOrEmpty(Server) || string.IsNullOrEmpty(Url) || string.IsNullOrEmpty(Password))
             {
+                return;
+            }
+
+            if (!PlayerList.Any())
+            {
+                LogDebug("No players on the server. Skipping team score retrieval and data send.");
                 return;
             }
 
